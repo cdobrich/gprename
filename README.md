@@ -1,11 +1,11 @@
-# GPRename — Modern Pyhon GTK 4 Rewrite
-
+# GPRename — Modern Python GTK 4 Rewrite
+```
    ___   ___  __
   / _ \ / _ \/__\ ___ ____   ____ ________   ___
  / /_\// /_)/ \/// _ \  _ \ / _  |  _   _ \ / _ \
 / /_\\/ ___/ _  \  __/ | | | (_| | | | | | |  __/
 \____/\/   \/ \_/\___|_| |_|\__,_|_| |_| |_|\___|
-
+```
  ***********************************************
 
 This source tree is a complete rewrite of the supplied GPRename (version 2023-04-29) program for modern Linux.
@@ -125,7 +125,7 @@ To run GPRename in another language, you need to open the application like so: `
 
 The complete list of available languages is in the locale directory.
 
-## Source preservation
+## Source Preservation
 
 The original project's translation `.po` files, license, icon, and historical
 documentation can be retained alongside this source tree. The GTK 4 rewrite
