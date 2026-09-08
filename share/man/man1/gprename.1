@@ -1,0 +1,36 @@
+." GPRename manual page
+.TH GPRENAME 1 "2026-08-17" "GPRename 2026.08" "User Commands"
+.SH NAME
+gprename \- graphical batch renamer for files and directories
+.SH SYNOPSIS
+.B gprename
+.RI [ PATH ]
+.SH DESCRIPTION
+GPRename is a graphical batch renamer for files and directories.  It provides
+case conversion, insertion and deletion, replacement with optional regular
+expressions, and sequential numeric renaming.
+.PP
+This release is a native Python 3 / GTK 4 rewrite of the historical Perl/Gtk3
+implementation.  It does not load Gtk3.pm or any Perl modules.
+.SH OPTIONS
+.TP
+.I PATH
+Open the specified directory.  If a regular file is supplied, its containing
+directory is opened.
+.SH FILES
+.TP
+.I ~/.config/gprename/gprename
+User settings, or the file below
+.I $XDG_CONFIG_HOME
+when that environment variable is set.
+.TP
+.I ~/.config/gprename/gprename_log
+Rename and undo log.
+.SH NOTES
+The safe rename implementation stages selected entries through unique
+temporary names.  This permits case-only changes and rename cycles without
+clobbering unrelated files.
+.SH AUTHOR
+GPRename contributors.
+.SH LICENSE
+GNU General Public License version 3 or later.

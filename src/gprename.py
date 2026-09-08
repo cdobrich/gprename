@@ -1,0 +1,1192 @@
+#!/usr/bin/env python3
+"""
+GPRename - modern GTK 4 rewrite.
+
+This version intentionally removes the historical Perl/Gtk3 stack.  The
+renaming engine is implemented with Python's standard-library filesystem,
+Unicode and regular-expression APIs, while the user interface uses GTK 4
+through PyGObject.
+
+GPRename is free software under the GNU GPL v3 or later.
+"""
+
+from __future__ import annotations
+
+import gettext
+import locale
+import os
+import re
+import shutil
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Optional
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk
+
+
+APP_ID = "org.gprename.GPRename"
+VERSION = "2026.08"
+MAX_PREVIEW_ITEMS = 10_000
+MAX_NAME_BYTES_FOR_TWO_PHASE_RENAME = 252
+
+
+def _install_paths() -> tuple[Path, Path]:
+    here = Path(__file__).resolve()
+    # Installed: PREFIX/bin/gprename -> PREFIX/share/locale.
+    prefix = here.parent.parent
+    locale_dir = prefix / "share" / "locale"
+    if not locale_dir.exists():
+        locale_dir = Path("/usr/share/locale")
+    return prefix, locale_dir
+
+
+_PREFIX, _LOCALE_DIR = _install_paths()
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
+gettext.bindtextdomain("gprename", str(_LOCALE_DIR))
+gettext.textdomain("gprename")
+_ = gettext.gettext
+
+
+def config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if base:
+        return Path(base) / "gprename"
+    return Path.home() / ".config" / "gprename"
+
+
+CONFIG_DIR = config_dir()
+SETTINGS_FILE = CONFIG_DIR / "gprename"
+LOG_FILE = CONFIG_DIR / "gprename_log"
+
+
+class Item(GObject.Object):
+    name = GObject.Property(type=str)
+    path = GObject.Property(type=str)
+
+    def __init__(self, name: str, path: str):
+        super().__init__()
+        self.name = name
+        self.path = path
+
+
+class PreviewItem(GObject.Object):
+    name = GObject.Property(type=str)
+    new_name = GObject.Property(type=str)
+
+    def __init__(self, name: str, new_name: str = ""):
+        super().__init__()
+        self.name = name
+        self.new_name = new_name
+
+
+def directory_children(node: Item) -> Gio.ListStore:
+    model = Gio.ListStore.new(Item)
+    path = Path(node.path)
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: p.name.casefold())
+    except OSError:
+        return model
+
+    show_hidden = AppState.instance.settings["show_hidden_files"]
+    for entry in entries:
+        if not entry.is_dir() or entry.name in (".", ".."):
+            continue
+        if entry.name.startswith(".") and not show_hidden:
+            continue
+        model.append(Item(entry.name, str(entry)))
+    return model
+
+
+class AppState:
+    _instance: Optional["AppState"] = None
+
+    def __init__(self) -> None:
+        self.settings = {
+            "trim_spaces": True,
+            "auto_preview": False,
+            "zero_autofill": True,
+            "fullscreen": False,
+            "width": 900,
+            "height": 620,
+            "security": False,
+            "hpaned_width": 250,
+            "show_hidden_files": False,
+            "remember_last_directory": False,
+            "remember_last_directory_path": "",
+        }
+        self.load_settings()
+
+    @classmethod
+    def instance(cls) -> "AppState":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def load_settings(self) -> None:
+        if not SETTINGS_FILE.exists():
+            return
+        try:
+            for line in SETTINGS_FILE.read_text(encoding="utf-8").splitlines():
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key not in self.settings:
+                    continue
+                old = self.settings[key]
+                if isinstance(old, bool):
+                    self.settings[key] = value.lower() in ("1", "true", "yes")
+                elif isinstance(old, int):
+                    try:
+                        self.settings[key] = int(value)
+                    except ValueError:
+                        pass
+                else:
+                    self.settings[key] = value
+        except OSError:
+            pass
+
+    def save_settings(self, width: int, height: int, hpaned_width: int, path: str) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        self.settings["width"] = width
+        self.settings["height"] = height
+        self.settings["hpaned_width"] = hpaned_width
+        self.settings["remember_last_directory_path"] = (
+            path if self.settings["remember_last_directory"] else ""
+        )
+        lines = []
+        for key in sorted(self.settings):
+            value = self.settings[key]
+            if isinstance(value, bool):
+                value = "1" if value else "0"
+            lines.append(f"{key}={value}")
+        tmp = SETTINGS_FILE.with_suffix(".tmp")
+        try:
+            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.replace(tmp, SETTINGS_FILE)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+class RenameOperation:
+    def __init__(self, directory: Path, old: str, new: str):
+        self.directory = directory
+        self.old = old
+        self.new = new
+
+    @property
+    def old_path(self) -> Path:
+        return self.directory / self.old
+
+    @property
+    def new_path(self) -> Path:
+        return self.directory / self.new
+
+
+class GPRenameWindow(Gtk.ApplicationWindow):
+    def __init__(self, app: Gtk.Application, initial_path: Optional[str]) -> None:
+        super().__init__(application=app)
+        self.state = AppState.instance()
+        self.set_title("GPRename")
+        self.set_default_size(self.state.settings["width"], self.state.settings["height"])
+
+        self.current_path = self._resolve_initial_path(initial_path)
+        self.filter_text = ""
+        self.show_path = False
+        self.security = not bool(self.state.settings["security"])
+        self.preview_names: list[str] = []
+        self.preview_new_names: list[str] = []
+        self.undo_operations: list[RenameOperation] = []
+        self.last_directory = self.current_path
+
+        self._build_actions()
+        self._build_ui()
+        self._load_directory(self.current_path)
+
+        if self.state.settings["fullscreen"]:
+            self.fullscreen()
+
+        self.connect("close-request", self._on_close)
+
+    def _resolve_initial_path(self, arg: Optional[str]) -> str:
+        if arg:
+            p = Path(arg).expanduser()
+            if not p.is_absolute():
+                p = Path.cwd() / p
+            if p.exists() and p.is_file():
+                p = p.parent
+            if p.exists() and p.is_dir():
+                return str(p.resolve())
+            print(_("Path doesn't exist!") + f": {arg}", file=sys.stderr)
+            raise SystemExit(1)
+
+        if self.state.settings["remember_last_directory"]:
+            remembered = self.state.settings["remember_last_directory_path"]
+            if remembered and Path(remembered).is_dir():
+                return str(Path(remembered).resolve())
+
+        return str(Path.cwd().resolve())
+
+    def _build_actions(self) -> None:
+        def action(name: str, callback: Callable, state: Optional[bool] = None) -> None:
+            a = Gio.SimpleAction.new_stateful(
+                name,
+                None,
+                GLib.Variant("b", state) if state is not None else None,
+            )
+            a.connect("activate", callback)
+            self.add_action(a)
+
+        action("quit", lambda *_: self.close())
+        action("trim-spaces", self._action_trim, self.state.settings["trim_spaces"])
+        action("zero-autofill", self._action_zero, self.state.settings["zero_autofill"])
+        action("auto-preview", self._action_auto_preview, self.state.settings["auto_preview"])
+        action("remember", self._action_remember, self.state.settings["remember_last_directory"])
+        action("hidden", self._action_hidden, self.state.settings["show_hidden_files"])
+        action("show-path", self._action_show_path, self.show_path)
+        action("fullscreen", self._action_fullscreen, self.state.settings["fullscreen"])
+        action("security", self._action_security, not self.security)
+        action("filter", lambda *_: self._show_filter())
+        action("view-log", lambda *_: self._show_log())
+        action("help", lambda *_: self._show_help())
+        action("about", lambda *_: self._show_about())
+
+    def _build_ui(self) -> None:
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_child(root)
+
+        root.append(self._build_menu_bar())
+
+        main_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        main_paned.set_vexpand(True)
+        root.append(main_paned)
+
+        upper = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        upper.set_vexpand(True)
+        main_paned.set_start_child(upper)
+
+        # Directory tree.
+        self.dir_root = Gio.ListStore.new(Item)
+        self.dir_root.append(Item("/", "/"))
+        tree_model = Gtk.TreeListModel.new(self.dir_root, False, False, directory_children)
+        tree_selection = Gtk.SingleSelection.new(tree_model)
+        tree_selection.connect("selection-changed", self._tree_selection_changed)
+
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._tree_setup)
+        factory.connect("bind", self._tree_bind)
+        tree_view = Gtk.ListView.new(tree_selection, factory)
+        tree_view.set_vexpand(True)
+        tree_scroll = Gtk.ScrolledWindow()
+        tree_scroll.set_min_content_width(180)
+        tree_scroll.set_child(tree_view)
+        upper.set_start_child(tree_scroll)
+        self.tree_selection = tree_selection
+        self.tree_model = tree_model
+        root_row = self.tree_model.get_item(0)
+        if root_row is not None:
+            root_row.set_expanded(True)
+
+        # File/directory list.
+        self.file_store = Gio.ListStore.new(PreviewItem)
+        self.dir_store = Gio.ListStore.new(PreviewItem)
+        self.file_selection = Gtk.MultiSelection.new(self.file_store)
+        self.dir_selection = Gtk.MultiSelection.new(self.dir_store)
+
+        self.file_list = self._make_preview_list(self.file_selection)
+        self.dir_list = self._make_preview_list(self.dir_selection)
+
+        self.file_scroller = Gtk.ScrolledWindow()
+        self.file_scroller.set_child(self.file_list)
+        self.dir_scroller = Gtk.ScrolledWindow()
+        self.dir_scroller.set_child(self.dir_list)
+
+        self.file_dir_stack = Gtk.Stack()
+        self.file_dir_stack.add_titled(self.file_scroller, "files", _("Files"))
+        self.file_dir_stack.add_titled(self.dir_scroller, "directories", _("Directories"))
+        self.file_dir_stack.connect("notify::visible-child-name", self._selection_changed)
+        upper.set_end_child(self.file_dir_stack)
+
+        self.main_paned = main_paned
+        self.hpaned = upper
+
+        # Operation controls.
+        lower = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        lower.set_margin_top(4)
+        lower.set_margin_bottom(4)
+        lower.set_margin_start(6)
+        lower.set_margin_end(6)
+        main_paned.set_end_child(lower)
+
+        self.status_label = Gtk.Label(xalign=0)
+        lower.append(self.status_label)
+
+        self.operations = self._build_operations()
+        lower.append(self.operations)
+
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        button_box.set_halign(Gtk.Align.END)
+        lower.append(button_box)
+
+        self.preview_button = Gtk.Button(label=_("Preview"))
+        self.preview_button.connect("clicked", lambda *_: self.preview())
+        button_box.append(self.preview_button)
+
+        self.apply_button = Gtk.Button(label=_("Rename"))
+        self.apply_button.connect("clicked", lambda *_: self.rename_now())
+        button_box.append(self.apply_button)
+
+        self.undo_button = Gtk.Button(label=_("Undo"))
+        self.undo_button.set_sensitive(False)
+        self.undo_button.connect("clicked", lambda *_: self.undo())
+        button_box.append(self.undo_button)
+
+        refresh = Gtk.Button(label=_("Refresh"))
+        refresh.connect("clicked", lambda *_: self.refresh())
+        button_box.append(refresh)
+
+        self._update_preview_buttons()
+
+    def _build_menu_bar(self) -> Gtk.Widget:
+        menubar = Gtk.PopoverMenuBar.new_from_model(self._menu_model())
+        return menubar
+
+    def _menu_model(self) -> Gio.Menu:
+        root = Gio.Menu()
+
+        file_menu = Gio.Menu()
+        file_menu.append(_("Quit"), "win.quit")
+        root.append_submenu(_("_File"), file_menu)
+
+        options = Gio.Menu()
+        for label, action in [
+            (_("Trim spaces"), "trim-spaces"),
+            (_("Zero auto-fill"), "zero-autofill"),
+            (_("Automatic preview"), "auto-preview"),
+            (_("Remember last directory"), "remember"),
+            (_("Show hidden files"), "hidden"),
+            (_("Show path"), "show-path"),
+            (_("Fullscreen"), "fullscreen"),
+            (_("Disable security check"), "security"),
+        ]:
+            item = Gio.MenuItem.new(label, f"win.{action}")
+            options.append_item(item)
+        options.append(_("Filter..."), "win.filter")
+        options.append(_("View log..."), "win.view-log")
+        root.append_submenu(_("_Options"), options)
+
+        help_menu = Gio.Menu()
+        help_menu.append(_("Contents"), "win.help")
+        help_menu.append(_("About"), "win.about")
+        root.append_submenu(_("_Help"), help_menu)
+        return root
+
+    def _tree_setup(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
+        expander = Gtk.TreeExpander()
+        label = Gtk.Label(xalign=0)
+        expander.set_child(label)
+        list_item.set_child(expander)
+
+    def _tree_bind(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
+        row = list_item.get_item()
+        expander = list_item.get_child()
+        expander.set_list_row(row)
+        node = row.get_item()
+        expander.get_child().set_text(node.name)
+
+    def _make_preview_list(self, selection: Gtk.SelectionModel) -> Gtk.ListView:
+        factory = Gtk.SignalListItemFactory()
+
+        def setup(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+            grid = Gtk.Grid(column_spacing=12)
+            grid.set_hexpand(True)
+            old = Gtk.Label(xalign=0)
+            old.set_hexpand(True)
+            new = Gtk.Label(xalign=0)
+            new.set_hexpand(True)
+            grid.attach(old, 0, 0, 1, 1)
+            grid.attach(new, 1, 0, 1, 1)
+            item.set_child(grid)
+
+        def bind(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+            obj = item.get_item()
+            grid = item.get_child()
+            grid.get_child_at(0, 0).set_text(obj.name)
+            grid.get_child_at(1, 0).set_text(obj.new_name)
+
+        factory.connect("setup", setup)
+        factory.connect("bind", bind)
+        view = Gtk.ListView.new(selection, factory)
+        view.set_vexpand(True)
+        view.set_hexpand(True)
+        view.connect("activate", self._list_activate)
+        return view
+
+    def _list_activate(self, _view: Gtk.ListView, _position: int) -> None:
+        if self.state.settings["auto_preview"]:
+            self.preview()
+
+    def _build_operations(self) -> Gtk.Widget:
+        self.operation_stack = Gtk.Stack()
+        self.operation_stack.set_vexpand(False)
+        self.operation_stack.set_hexpand(True)
+        self.operation_stack.connect("notify::visible-child-name", lambda *_: self._maybe_preview())
+
+        self.case_page = self._case_page()
+        self.insdel_page = self._insert_delete_page()
+        self.replace_page = self._replace_page()
+        self.numeric_page = self._numeric_page()
+
+        self.operation_stack.add_titled(self.case_page, "case", _("Case Change"))
+        self.operation_stack.add_titled(self.insdel_page, "insdel", _("Insert / Delete"))
+        self.operation_stack.add_titled(self.replace_page, "replace", _("Replace / Remove"))
+        self.operation_stack.add_titled(self.numeric_page, "numeric", _("Numerical"))
+
+        switcher = Gtk.StackSwitcher()
+        switcher.set_stack(self.operation_stack)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(switcher)
+        box.append(self.operation_stack)
+        return box
+
+    def _entry(self, max_length: int = 254, width: int = 0) -> Gtk.Entry:
+        e = Gtk.Entry()
+        e.set_max_length(max_length)
+        if width:
+            e.set_width_chars(width)
+        e.connect("changed", lambda *_: self._maybe_preview())
+        return e
+
+    def _radio_group(self, labels: list[str], active: int = 0) -> list[Gtk.CheckButton]:
+        buttons: list[Gtk.CheckButton] = []
+        group = None
+        for i, label in enumerate(labels):
+            b = Gtk.CheckButton(label=label)
+            if group is not None:
+                b.set_group(group)
+            if i == active:
+                b.set_active(True)
+                group = b
+            buttons.append(b)
+            b.connect("toggled", lambda *_: self._maybe_preview())
+        return buttons
+
+    def _case_page(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.case_buttons = self._radio_group([
+            _("ALL UPPERCASE"),
+            _("all lowercase"),
+            _("CamelCase"),
+            _("Only the first letter"),
+            _("Only The First Letter And After"),
+        ])
+        for b in self.case_buttons:
+            box.append(b)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.case_after = self._entry(254, 10)
+        self.case_after.set_text(" _-([")
+        row.append(self.case_buttons[4])
+        row.append(self.case_after)
+        # The fifth radio button was already appended; show it only in this row.
+        box.remove(self.case_buttons[4])
+        box.append(row)
+        return box
+
+    def _spin(self, value: int, lower: int, upper: int) -> Gtk.SpinButton:
+        s = Gtk.SpinButton.new_with_range(lower, upper, 1)
+        s.set_value(value)
+        s.connect("value-changed", lambda *_: self._maybe_preview())
+        return s
+
+    def _insert_delete_page(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.insert_radio = Gtk.CheckButton(label=_("Insert"))
+        self.delete_radio = Gtk.CheckButton(label=_("Delete between"))
+        self.delete_radio.set_group(self.insert_radio)
+        self.insert_radio.set_active(True)
+        self.insert_radio.connect("toggled", lambda *_: self._maybe_preview())
+        self.delete_radio.connect("toggled", lambda *_: self._maybe_preview())
+
+        self.insert_entry = self._entry()
+        self.insert_spin = self._spin(0, -256, 256)
+        self.insert_entry.connect("grab-focus", lambda *_: self.insert_radio.set_active(True))
+        self.insert_spin.connect("grab-focus", lambda *_: self.insert_radio.set_active(True))
+        row1.append(self.insert_radio)
+        row1.append(self.insert_entry)
+        row1.append(Gtk.Label(label=_("at position")))
+        row1.append(self.insert_spin)
+
+        row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.delete_from = self._spin(0, -256, 256)
+        self.delete_to = self._spin(1, -256, 256)
+        self.delete_from.connect("grab-focus", lambda *_: self.delete_radio.set_active(True))
+        self.delete_to.connect("grab-focus", lambda *_: self.delete_radio.set_active(True))
+        row2.append(self.delete_radio)
+        row2.append(self.delete_from)
+        row2.append(Gtk.Label(label=_("and")))
+        row2.append(self.delete_to)
+
+        box.append(row1)
+        box.append(row2)
+        return box
+
+    def _replace_page(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.append(Gtk.Label(label=_("Replace")))
+        self.replace_this = self._entry(99, 30)
+        row.append(self.replace_this)
+        row.append(Gtk.Label(label=_("with")))
+        self.replace_with = self._entry(99, 30)
+        row.append(self.replace_with)
+        box.append(row)
+
+        self.replace_case = Gtk.CheckButton(label=_("Case sensitive"))
+        self.replace_regex = Gtk.CheckButton(label=_("Regular expression"))
+        for b in (self.replace_case, self.replace_regex):
+            b.connect("toggled", lambda *_: self._maybe_preview())
+            box.append(b)
+        return box
+
+    def _numeric_page(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.numeric_start = self._spin(1, 0, 999999)
+        self.numeric_increment = self._spin(1, 1, 9999)
+        row1.append(Gtk.Label(label=_("Add numbers starting at")))
+        row1.append(self.numeric_start)
+        row1.append(Gtk.Label(label=_("and increment by")))
+        row1.append(self.numeric_increment)
+
+        row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.numeric_prefix = self._entry(254, 9)
+        self.numeric_suffix = self._entry(254, 9)
+        row2.append(Gtk.Label(label=_("Insert before the numbers")))
+        row2.append(self.numeric_prefix)
+        row2.append(Gtk.Label(label=_("and after")))
+        row2.append(self.numeric_suffix)
+
+        row3 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row3.append(Gtk.Label(label=_("Keep existing names")))
+        self.keep_before = Gtk.CheckButton(label=_("Before the numbers"))
+        self.keep_after = Gtk.CheckButton(label=_("After the numbers"))
+        self.keep_none = Gtk.CheckButton(label=_("No"))
+        self.keep_after.set_group(self.keep_before)
+        self.keep_none.set_group(self.keep_before)
+        self.keep_none.set_active(True)
+        for b in (self.keep_before, self.keep_after, self.keep_none):
+            b.connect("toggled", lambda *_: self._maybe_preview())
+            row3.append(b)
+
+        box.append(row1)
+        box.append(row2)
+        box.append(row3)
+        return box
+
+    def _selected_model(self) -> tuple[Gio.ListStore, Gtk.MultiSelection]:
+        if self.file_dir_stack.get_visible_child_name() == "files":
+            return self.file_store, self.file_selection
+        return self.dir_store, self.dir_selection
+
+    def _selected_names(self) -> list[str]:
+        store, selection = self._selected_model()
+        names = []
+        for i in range(store.get_n_items()):
+            if selection.is_selected(i):
+                names.append(store.get_item(i).name)
+        return names
+
+    def _tree_selection_changed(self, selection: Gtk.SingleSelection, _position: int, _n: int) -> None:
+        item = selection.get_selected_item()
+        if item is None:
+            return
+        row = item.get_item()
+        self.current_path = row.path
+        self.last_directory = self.current_path
+        self._load_directory(self.current_path)
+
+    def _selection_changed(self, *_args) -> None:
+        self._update_status()
+        self._maybe_preview()
+
+    def _maybe_preview(self) -> None:
+        if self.state.settings["auto_preview"]:
+            self.preview()
+
+    def _load_directory(self, path: str) -> None:
+        p = Path(path)
+        self.file_store.remove_all()
+        self.dir_store.remove_all()
+        try:
+            entries = sorted(p.iterdir(), key=lambda x: x.name.casefold())
+        except OSError as exc:
+            self._show_error(_("Cannot read directory."), str(exc))
+            self._update_status()
+            return
+
+        show_hidden = self.state.settings["show_hidden_files"]
+        filter_text = self.filter_text.casefold()
+
+        files = []
+        dirs = []
+        for entry in entries:
+            if entry.name.startswith(".") and not show_hidden:
+                continue
+            if filter_text and filter_text not in entry.name.casefold():
+                continue
+            try:
+                is_dir = entry.is_dir()
+                is_file = entry.is_file()
+            except OSError:
+                continue
+            if is_file:
+                display = str(entry) if self.show_path else entry.name
+                files.append(PreviewItem(display))
+            elif is_dir and entry.name not in (".", ".."):
+                display = str(entry) if self.show_path else entry.name
+                dirs.append(PreviewItem(display))
+
+        for item in files:
+            self.file_store.append(item)
+        for item in dirs:
+            self.dir_store.append(item)
+
+        if len(files) >= MAX_PREVIEW_ITEMS or len(dirs) >= MAX_PREVIEW_ITEMS:
+            self.state.settings["auto_preview"] = False
+            self._set_action_state("auto-preview", False)
+
+        self._update_status()
+        if self.state.settings["auto_preview"]:
+            self.preview()
+
+    def _update_status(self) -> None:
+        files = self.file_store.get_n_items()
+        dirs = self.dir_store.get_n_items()
+        _, selection = self._selected_model()
+        selected = selection.get_n_items() if hasattr(selection, "get_n_items") else 0
+        # GTK4 MultiSelection does not expose a count directly; calculate it.
+        selected = 0
+        store, selection = self._selected_model()
+        for i in range(store.get_n_items()):
+            selected += int(selection.is_selected(i))
+        self.status_label.set_text(
+            f"{files} {_('File' if files == 1 else 'Files')} | "
+            f"{dirs} {_('Directory' if dirs == 1 else 'Directories')} | "
+            f"{selected} {_('Selected')}"
+        )
+
+    def _set_action_state(self, name: str, active: bool) -> None:
+        action = self.lookup_action(name)
+        if action:
+            action.set_state(GLib.Variant("b", active))
+
+    def _action_trim(self, action: Gio.SimpleAction, _parameter: Optional[GLib.Variant]) -> None:
+        self.state.settings["trim_spaces"] = not self.state.settings["trim_spaces"]
+        action.set_state(GLib.Variant("b", self.state.settings["trim_spaces"]))
+        self._maybe_preview()
+
+    def _action_zero(self, action: Gio.SimpleAction, _parameter) -> None:
+        self.state.settings["zero_autofill"] = not self.state.settings["zero_autofill"]
+        action.set_state(GLib.Variant("b", self.state.settings["zero_autofill"]))
+        self._maybe_preview()
+
+    def _action_auto_preview(self, action: Gio.SimpleAction, _parameter) -> None:
+        self.state.settings["auto_preview"] = not self.state.settings["auto_preview"]
+        action.set_state(GLib.Variant("b", self.state.settings["auto_preview"]))
+        self._update_preview_buttons()
+        self._maybe_preview()
+
+    def _action_remember(self, action: Gio.SimpleAction, _parameter) -> None:
+        self.state.settings["remember_last_directory"] = not self.state.settings["remember_last_directory"]
+        action.set_state(GLib.Variant("b", self.state.settings["remember_last_directory"]))
+
+    def _action_hidden(self, action: Gio.SimpleAction, _parameter) -> None:
+        self.state.settings["show_hidden_files"] = not self.state.settings["show_hidden_files"]
+        action.set_state(GLib.Variant("b", self.state.settings["show_hidden_files"]))
+        self._rebuild_tree()
+        self._load_directory(self.current_path)
+
+    def _action_show_path(self, action: Gio.SimpleAction, _parameter) -> None:
+        self.show_path = not self.show_path
+        action.set_state(GLib.Variant("b", self.show_path))
+        self._load_directory(self.current_path)
+
+    def _action_fullscreen(self, action: Gio.SimpleAction, _parameter) -> None:
+        active = not self.state.settings["fullscreen"]
+        self.state.settings["fullscreen"] = active
+        action.set_state(GLib.Variant("b", active))
+        if active:
+            self.fullscreen()
+        else:
+            self.unfullscreen()
+
+    def _action_security(self, action: Gio.SimpleAction, _parameter) -> None:
+        self.security = not self.security
+        # Settings stores the historical "disable security" flag, while
+        # self.security means that the safety check is enabled.
+        self.state.settings["security"] = not self.security
+        action.set_state(GLib.Variant("b", not self.security))
+        self._maybe_preview()
+
+    def _update_preview_buttons(self) -> None:
+        auto = self.state.settings["auto_preview"]
+        self.preview_button.set_sensitive(not auto)
+        self.apply_button.set_sensitive(auto or bool(self.preview_new_names))
+
+    def _strip(self, value: str) -> str:
+        if not self.state.settings["trim_spaces"]:
+            return value
+        return re.sub(r"\s+", " ", value.strip())
+
+    def _base_name(self, value: str) -> str:
+        return Path(value).name if self.show_path else value
+
+    def _case_transform(self, name: str) -> str:
+        value = self._strip(self._base_name(name))
+        buttons = self.case_buttons
+        if buttons[0].get_active():
+            return value.upper()
+        if buttons[1].get_active():
+            return value.lower()
+        if buttons[2].get_active():
+            value = value.lower()
+            chars = list(value)
+            if chars:
+                chars[0] = chars[0].upper()
+            for i, char in enumerate(chars[:-1]):
+                if char == " ":
+                    chars[i + 1] = chars[i + 1].upper()
+            return "".join(chars).replace(" ", "")
+        if buttons[3].get_active():
+            value = value.lower()
+            chars = list(value)
+            for i, char in enumerate(chars):
+                if char.islower():
+                    chars[i] = char.upper()
+                    break
+            return "".join(chars)
+        value = value.lower()
+        chars = list(value)
+        separators = set(self.case_after.get_text())
+        if chars:
+            chars[0] = chars[0].upper()
+        for i, char in enumerate(chars[:-1]):
+            if char in separators:
+                chars[i + 1] = chars[i + 1].upper()
+        return "".join(chars)
+
+    def _insert_delete_transform(self, name: str) -> str:
+        value = self._strip(self._base_name(name))
+        if self.insert_radio.get_active() and self.insert_entry.get_text():
+            pos = self.insert_spin.get_value_as_int()
+            if pos > len(value) or pos < -len(value):
+                pos = len(value)
+            return value[:pos] + self.insert_entry.get_text() + value[pos:]
+        if self.delete_radio.get_active():
+            start = self.delete_from.get_value_as_int()
+            end = self.delete_to.get_value_as_int()
+            if end > len(value) or end < -len(value):
+                end = len(value)
+            return value[:start] + value[end:]
+        return value
+
+    def _regex_replace(self, pattern: str, replacement: str, value: str, case_sensitive: bool) -> str:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            match = re.search(pattern, value, flags)
+        except re.error as exc:
+            raise ValueError(_("Invalid regular expression: ") + str(exc)) from exc
+        if not match:
+            return value
+
+        # GPRename's historical syntax uses :1, :2 ... for capture groups.
+        result = value[:match.start()] + replacement + value[match.end():]
+        groups = match.groups()
+        for i, group in enumerate(groups, 1):
+            if group is not None:
+                result = result.replace(f":{i}", group)
+        return result
+
+    def _replace_transform(self, name: str) -> str:
+        value = self._strip(self._base_name(name))
+        find = self.replace_this.get_text()
+        replacement = self.replace_with.get_text()
+        if not find:
+            return value
+        if self.replace_regex.get_active():
+            return self._regex_replace(find, replacement, value, self.replace_case.get_active())
+        if self.replace_case.get_active():
+            return value.replace(find, replacement)
+        return re.sub(re.escape(find), replacement, value, count=0, flags=re.IGNORECASE)
+
+    def _numeric_transform(self, names: list[str]) -> list[str]:
+        start = self.numeric_start.get_value_as_int()
+        increment = self.numeric_increment.get_value_as_int()
+        prefix = self.numeric_prefix.get_text()
+        suffix = self.numeric_suffix.get_text()
+
+        count = len(names)
+        max_no = len(str((count - 1) * increment + start)) if count else 1
+        number = start
+        result = []
+        for original in names:
+            base = self._strip(self._base_name(original))
+            before = base if self.keep_before.get_active() else ""
+            after = base if self.keep_after.get_active() else ""
+            number_text = str(number)
+            if self.state.settings["zero_autofill"]:
+                number_text = number_text.zfill(max_no)
+            result.append(f"{before}{prefix}{number_text}{suffix}{after}")
+            number += increment
+        return result
+
+    def _transform_names(self, names: list[str]) -> list[str]:
+        page = self.operation_stack.get_visible_child_name()
+        if page == "case":
+            return [self._case_transform(x) for x in names]
+        if page == "insdel":
+            return [self._insert_delete_transform(x) for x in names]
+        if page == "replace":
+            return [self._replace_transform(x) for x in names]
+        return self._numeric_transform(names)
+
+    def preview(self) -> None:
+        store, selection = self._selected_model()
+        all_names = []
+        selected = []
+        for i in range(store.get_n_items()):
+            item = store.get_item(i)
+            all_names.append(item.name)
+            if selection.is_selected(i):
+                selected.append(i)
+
+        # Original behavior: no selection means all rows; otherwise only selected rows.
+        indices = selected if selected else list(range(len(all_names)))
+        transformed = self._transform_names([all_names[i] for i in indices])
+
+        transformed_by_index = {i: transformed[n] for n, i in enumerate(indices)}
+        self.preview_names = []
+        self.preview_new_names = []
+        for i, original in enumerate(all_names):
+            new = transformed_by_index.get(i, "")
+            self.preview_names.append(original)
+            self.preview_new_names.append(new)
+            store.get_item(i).new_name = new
+
+        self._update_status()
+        self._update_preview_buttons()
+
+    def _planned_operations(self) -> list[RenameOperation]:
+        store, _selection = self._selected_model()
+        directory = Path(self.current_path)
+        ops = []
+        for i in range(store.get_n_items()):
+            item = store.get_item(i)
+            new = item.new_name
+            if not new:
+                continue
+            old = Path(item.name).name
+            if old == new:
+                continue
+            if "/" in new or "\x00" in new:
+                raise ValueError(_("A new name cannot contain '/' or a NUL byte."))
+            if new in (".", ".."):
+                raise ValueError(_("A new name cannot be '.' or '..'."))
+            if len(new.encode("utf-8")) > MAX_NAME_BYTES_FOR_TWO_PHASE_RENAME:
+                raise ValueError(_("The new filename is too long for the safe two-phase rename."))
+            ops.append(RenameOperation(directory, old, new))
+        return ops
+
+    def rename_now(self) -> None:
+        try:
+            if not self.preview_new_names or not any(self.preview_new_names):
+                self.preview()
+            operations = self._planned_operations()
+            if not operations:
+                return
+
+            self._validate_operations(operations)
+            self._perform_operations(operations)
+            self.undo_operations = operations
+            self.undo_button.set_sensitive(True)
+            self._write_log(operations)
+            self._load_directory(self.current_path)
+            self.check_log_size()
+        except (OSError, ValueError) as exc:
+            self._show_error(_("Rename failed."), str(exc))
+        finally:
+            self._update_preview_buttons()
+
+    def _validate_operations(self, operations: list[RenameOperation]) -> None:
+        source_paths = {op.old_path.resolve() for op in operations}
+        targets: set[Path] = set()
+        for op in operations:
+            target = op.new_path
+            if self.security and target.exists() and target.resolve() not in source_paths:
+                raise ValueError(
+                    _("Cannot rename because the destination already exists.") +
+                    f"\n\n{target}"
+                )
+            key = target.resolve()
+            if key in targets:
+                raise ValueError(_("Two selected items would receive the same new name."))
+            targets.add(key)
+
+    def _perform_operations(self, operations: list[RenameOperation]) -> None:
+        # First move every source to a unique hidden temporary name.  This
+        # handles case-only changes and cycles such as a->b, b->a.
+        staged: list[tuple[Path, Path, RenameOperation]] = []
+        try:
+            for op in operations:
+                source = op.old_path
+                if not source.exists():
+                    raise OSError(f"{source}: {os.strerror(2)}")
+                fd, temp_name = tempfile.mkstemp(prefix=".gprename-", dir=str(op.directory))
+                os.close(fd)
+                temp = Path(temp_name)
+                temp.unlink()
+                os.rename(source, temp)
+                staged.append((source, temp, op))
+
+            for source, temp, op in staged:
+                try:
+                    os.rename(temp, op.new_path)
+                except Exception:
+                    # Best effort rollback of the item currently being placed.
+                    if temp.exists() and not source.exists():
+                        os.rename(temp, source)
+                    raise
+        except Exception:
+            for source, temp, _op in reversed(staged):
+                if temp.exists() and not source.exists():
+                    try:
+                        os.rename(temp, source)
+                    except OSError:
+                        pass
+            raise
+
+    def undo(self) -> None:
+        if not self.undo_operations:
+            return
+        try:
+            # Reverse order and stage again so cycles are safe.
+            reverse = [
+                RenameOperation(op.directory, op.new, op.old)
+                for op in reversed(self.undo_operations)
+            ]
+            # Undo is intentionally strict: never overwrite an unrelated file.
+            source_paths = {op.old_path.resolve() for op in reverse}
+            for op in reverse:
+                if op.new_path.exists() and op.new_path.resolve() not in source_paths:
+                    raise ValueError(_("Undo would overwrite an existing file.") + f"\n\n{op.new_path}")
+            self._perform_operations(reverse)
+            self._write_log(reverse, undo=True)
+            self.undo_operations = []
+            self.undo_button.set_sensitive(False)
+            self._load_directory(self.current_path)
+        except (OSError, ValueError) as exc:
+            self._show_error(_("Undo failed."), str(exc))
+
+    def _write_log(self, operations: list[RenameOperation], undo: bool = False) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().astimezone().strftime('%a %b %d %H:%M:%S %Y')} - {self.current_path}\n")
+                for op in operations:
+                    if undo:
+                        f.write(f"{op.old:<{max(1, max(len(x.old) for x in operations))}} => {op.new}\n")
+                    else:
+                        f.write(f"{op.old:<{max(1, max(len(x.old) for x in operations))}} => {op.new}\n")
+                f.write("\n")
+        except OSError:
+            pass
+
+    def check_log_size(self) -> None:
+        try:
+            if LOG_FILE.stat().st_size > 1_000_000:
+                self._show_info(
+                    _("The log file is over 1M, you should clear it from the Options menu.")
+                )
+        except OSError:
+            pass
+
+    def refresh(self) -> None:
+        self._rebuild_tree()
+        self._load_directory(self.current_path)
+
+    def _rebuild_tree(self) -> None:
+        self.dir_root = Gio.ListStore.new(Item)
+        self.dir_root.append(Item("/", "/"))
+        self.tree_model = Gtk.TreeListModel.new(self.dir_root, False, False, directory_children)
+        self.tree_selection.set_model(self.tree_model)
+
+    def _show_filter(self) -> None:
+        dialog = Gtk.Window(transient_for=self, modal=True, title=_("Filter"))
+        dialog.set_default_size(420, 120)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(12); box.set_margin_bottom(12)
+        box.set_margin_start(12); box.set_margin_end(12)
+        box.append(Gtk.Label(label=_("Only show files or directories that contains"), xalign=0))
+        entry = Gtk.Entry()
+        entry.set_text(self.filter_text)
+        entry.connect("changed", lambda e: self._set_filter(e.get_text()))
+        box.append(entry)
+        close = Gtk.Button(label=_("Close"))
+        close.connect("clicked", lambda *_: dialog.close())
+        box.append(close)
+        dialog.set_child(box)
+        dialog.present()
+
+    def _set_filter(self, text: str) -> None:
+        self.filter_text = text
+        self._load_directory(self.current_path)
+
+    def _show_log(self) -> None:
+        dialog = Gtk.Window(transient_for=self, modal=True, title=_("View log"))
+        dialog.set_default_size(700, 500)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(8); box.set_margin_end(8)
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_monospace(True)
+        try:
+            content = LOG_FILE.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        view.get_buffer().set_text(content)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_child(view)
+        box.append(scroll)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        clear = Gtk.Button(label=_("Clear"))
+        clear.set_sensitive(bool(content))
+        def clear_log(*_):
+            try:
+                LOG_FILE.unlink(missing_ok=True)
+                view.get_buffer().set_text("")
+                clear.set_sensitive(False)
+            except OSError as exc:
+                self._show_error(_("Cannot clear log."), str(exc))
+        clear.connect("clicked", clear_log)
+        close = Gtk.Button(label=_("Close"))
+        close.connect("clicked", lambda *_: dialog.close())
+        buttons.append(clear); buttons.append(close)
+        box.append(buttons)
+        dialog.set_child(box)
+        dialog.present()
+
+    def _show_help(self) -> None:
+        text = _(
+            "Tips\n\n"
+            "Options\n"
+            "- Trim spaces: Automatically trim repeated spaces and remove spaces at the beginning or end.\n\n"
+            "- Zero auto-fill: In Numerical mode, 1 becomes 01 when the sequence requires two digits, "
+            "001 when it requires three, and so on.\n\n"
+            "- Automatic preview: This is disabled automatically for directories with 10,000 or more "
+            "files or directories.\n\n"
+            "- Disable security check: permits destinations that already exist. Use with care.\n\n"
+            "Insert / Delete\n"
+            "- Negative positions count from the end.\n\n"
+            "Replace / Remove\n"
+            "- Regular-expression replacements support :1, :2, ... capture-group references."
+        )
+        self._show_text_window(_("Tips"), text, 540, 460)
+
+    def _show_about(self) -> None:
+        text = (
+            f"GPRename {VERSION}\n\n"
+            "A complete batch renamer for files and directories.\n\n"
+            "This release is a modern GTK 4 rewrite of the original GPRename "
+            "application. It no longer uses Perl, Gtk3.pm, or the GTK 3 Perl bindings.\n\n"
+            "GPRename is free software under the GNU GPL v3 or later."
+        )
+        self._show_text_window(_("About"), text, 520, 360)
+
+    def _show_text_window(self, title: str, text: str, width: int, height: int) -> None:
+        dialog = Gtk.Window(transient_for=self, modal=True, title=title)
+        dialog.set_default_size(width, height)
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_wrap_mode(Gtk.WrapMode.WORD)
+        view.get_buffer().set_text(text)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_child(view)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(8); box.set_margin_end(8)
+        box.append(scroll)
+        close = Gtk.Button(label=_("Close"))
+        close.connect("clicked", lambda *_: dialog.close())
+        box.append(close)
+        dialog.set_child(box)
+        dialog.present()
+
+    def _show_info(self, message: str) -> None:
+        self._show_message(_("Information"), message)
+
+    def _show_error(self, title: str, message: str) -> None:
+        self._show_message(title, message)
+
+    def _show_message(self, title: str, message: str) -> None:
+        dialog = Gtk.Window(transient_for=self, modal=True, title=title)
+        dialog.set_default_size(440, 180)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(16); box.set_margin_bottom(16)
+        box.set_margin_start(16); box.set_margin_end(16)
+        label = Gtk.Label(label=message, wrap=True, xalign=0)
+        box.append(label)
+        button = Gtk.Button(label=_("OK"))
+        button.set_halign(Gtk.Align.END)
+        button.connect("clicked", lambda *_: dialog.close())
+        box.append(button)
+        dialog.set_child(box)
+        dialog.present()
+
+    def _on_close(self, *_args) -> bool:
+        width = self.get_width()
+        height = self.get_height()
+        self.state.save_settings(width, height, self.hpaned.get_position(), self.current_path)
+        return False
+
+
+class GPRenameApp(Gtk.Application):
+    def __init__(self, initial_path: Optional[str]) -> None:
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags(0))
+        self.initial_path = initial_path
+        self.window: Optional[GPRenameWindow] = None
+        self.connect("activate", self._activate)
+
+    def _activate(self, *_args) -> None:
+        if self.window is None:
+            self.window = GPRenameWindow(self, self.initial_path)
+        self.window.present()
+
+
+
+def main() -> int:
+    initial = None
+    if len(sys.argv) > 1:
+        initial = sys.argv[1]
+    app = GPRenameApp(initial)
+    return app.run(sys.argv[:1])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

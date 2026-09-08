@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GPRename
+GenericName=Batch File Renamer
+Comment=Rename files and directories in batch
+Exec=gprename %F
+Icon=gprename
+Terminal=false
+Keywords=renamer;rename;files;directories;utility;
+Categories=Utility;FileTools;
+StartupNotify=true
