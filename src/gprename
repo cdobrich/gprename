@@ -96,7 +96,7 @@ def directory_children(node: Item) -> Gio.ListStore:
     except OSError:
         return model
 
-    show_hidden = AppState.instance.settings["show_hidden_files"]
+    show_hidden = AppState.instance().settings["show_hidden_files"]
     for entry in entries:
         if not entry.is_dir() or entry.name in (".", ".."):
             continue
@@ -207,12 +207,15 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         self.security = not bool(self.state.settings["security"])
         self.preview_names: list[str] = []
         self.preview_new_names: list[str] = []
+        self._building_ui = True
         self.undo_operations: list[RenameOperation] = []
         self.last_directory = self.current_path
 
         self._build_actions()
         self._build_ui()
         self._load_directory(self.current_path)
+        self._building_ui = False
+        self._maybe_preview()
 
         if self.state.settings["fullscreen"]:
             self.fullscreen()
@@ -505,10 +508,11 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.case_after = self._entry(254, 10)
         self.case_after.set_text(" _-([")
+        # Move the fifth radio button into the secondary row.  GTK4 widgets
+        # cannot be appended to a new parent while still parented by the old one.
+        box.remove(self.case_buttons[4])
         row.append(self.case_buttons[4])
         row.append(self.case_after)
-        # The fifth radio button was already appended; show it only in this row.
-        box.remove(self.case_buttons[4])
         box.append(row)
         return box
 
@@ -531,8 +535,8 @@ class GPRenameWindow(Gtk.ApplicationWindow):
 
         self.insert_entry = self._entry()
         self.insert_spin = self._spin(0, -256, 256)
-        self.insert_entry.connect("grab-focus", lambda *_: self.insert_radio.set_active(True))
-        self.insert_spin.connect("grab-focus", lambda *_: self.insert_radio.set_active(True))
+        self.insert_entry.connect("notify::has-focus", lambda w, _pspec: self.insert_radio.set_active(True) if w.has_focus() else None)
+        self.insert_spin.connect("notify::has-focus", lambda w, _pspec: self.insert_radio.set_active(True) if w.has_focus() else None)
         row1.append(self.insert_radio)
         row1.append(self.insert_entry)
         row1.append(Gtk.Label(label=_("at position")))
@@ -541,8 +545,8 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.delete_from = self._spin(0, -256, 256)
         self.delete_to = self._spin(1, -256, 256)
-        self.delete_from.connect("grab-focus", lambda *_: self.delete_radio.set_active(True))
-        self.delete_to.connect("grab-focus", lambda *_: self.delete_radio.set_active(True))
+        self.delete_from.connect("notify::has-focus", lambda w, _pspec: self.delete_radio.set_active(True) if w.has_focus() else None)
+        self.delete_to.connect("notify::has-focus", lambda w, _pspec: self.delete_radio.set_active(True) if w.has_focus() else None)
         row2.append(self.delete_radio)
         row2.append(self.delete_from)
         row2.append(Gtk.Label(label=_("and")))
@@ -633,6 +637,8 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         self._maybe_preview()
 
     def _maybe_preview(self) -> None:
+        if self._building_ui:
+            return
         if self.state.settings["auto_preview"]:
             self.preview()
 
