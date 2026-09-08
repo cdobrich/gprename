@@ -98,7 +98,15 @@ def directory_children(node: Item) -> Gio.ListStore:
 
     show_hidden = AppState.instance().settings["show_hidden_files"]
     for entry in entries:
-        if not entry.is_dir() or entry.name in (".", ".."):
+        if entry.name in (".", ".."):
+            continue
+        try:
+            # Do not recurse through symbolic links in the folder tree.
+            # This prevents cycles such as /var/run -> /run while still
+            # allowing ordinary directories to be expanded normally.
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+        except OSError:
             continue
         if entry.name.startswith(".") and not show_hidden:
             continue
@@ -624,12 +632,32 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         return names
 
     def _tree_selection_changed(self, selection: Gtk.SingleSelection, _position: int, _n: int) -> None:
-        item = selection.get_selected_item()
+        # Gtk.SingleSelection operates on Gtk.TreeListRow objects when its
+        # model is a Gtk.TreeListModel.  Always use the row itself for the
+        # path, and expand a directory when it is selected so users do not
+        # have to hit a tiny expander arrow before its children become
+        # visible.
+        row = selection.get_selected_item()
+        if row is None:
+            return
+
+        item = row.get_item()
         if item is None:
             return
-        row = item.get_item()
-        self.current_path = row.path
+
+        path = Path(item.path)
+        if not path.is_dir():
+            return
+
+        self.current_path = str(path.resolve())
         self.last_directory = self.current_path
+
+        # Expand the selected tree row.  This is deliberately done on
+        # selection rather than only on arrow activation, which makes the
+        # GTK4 tree behave like the old GPRename folder browser.
+        if not row.get_expanded():
+            row.set_expanded(True)
+
         self._load_directory(self.current_path)
 
     def _selection_changed(self, *_args) -> None:
@@ -1042,10 +1070,19 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         self._load_directory(self.current_path)
 
     def _rebuild_tree(self) -> None:
+        # Rebuild the filesystem tree without destroying the existing
+        # Gtk.ListView.  The root is a real filesystem directory, so every
+        # child is represented by its absolute path and can itself lazily
+        # populate another level.
         self.dir_root = Gio.ListStore.new(Item)
         self.dir_root.append(Item("/", "/"))
-        self.tree_model = Gtk.TreeListModel.new(self.dir_root, False, False, directory_children)
+        self.tree_model = Gtk.TreeListModel.new(
+            self.dir_root, False, False, directory_children
+        )
         self.tree_selection.set_model(self.tree_model)
+        root_row = self.tree_model.get_item(0)
+        if root_row is not None:
+            root_row.set_expanded(True)
 
     def _show_filter(self) -> None:
         dialog = Gtk.Window(transient_for=self, modal=True, title=_("Filter"))
