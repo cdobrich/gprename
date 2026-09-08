@@ -240,11 +240,19 @@ class GPRenameWindow(Gtk.ApplicationWindow):
 
     def _build_actions(self) -> None:
         def action(name: str, callback: Callable, state: Optional[bool] = None) -> None:
-            a = Gio.SimpleAction.new_stateful(
-                name,
-                None,
-                GLib.Variant("b", state) if state is not None else None,
-            )
+            # Gio.SimpleAction.new_stateful() requires a non-NULL initial
+            # state.  GTK/GIO does not accept None for that argument, even
+            # though the action itself may legitimately be stateless.
+            # Create a normal SimpleAction for stateless commands and a
+            # stateful one only for the boolean toggle commands.
+            if state is None:
+                a = Gio.SimpleAction.new(name, None)
+            else:
+                a = Gio.SimpleAction.new_stateful(
+                    name,
+                    None,
+                    GLib.Variant("b", state),
+                )
             a.connect("activate", callback)
             self.add_action(a)
 
