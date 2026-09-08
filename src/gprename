@@ -35,6 +35,13 @@ VERSION = "2026.08"
 MAX_PREVIEW_ITEMS = 10_000
 MAX_NAME_BYTES_FOR_TWO_PHASE_RENAME = 252
 
+# Initial proportions for the three primary panes. Gtk.Paned positions are
+# pixel values, so these percentages are converted after the window has been
+# allocated its initial size. They are intentionally kept together here so
+# the startup layout can be tuned without searching through the UI builder.
+INITIAL_TREE_WIDTH_PERCENT = 25
+INITIAL_OPERATION_HEIGHT_PERCENT = 35
+
 
 def _install_paths() -> tuple[Path, Path]:
     here = Path(__file__).resolve()
@@ -54,6 +61,15 @@ except locale.Error:
 gettext.bindtextdomain("gprename", str(_LOCALE_DIR))
 gettext.textdomain("gprename")
 _ = gettext.gettext
+
+
+def initial_pane_positions(width: int, height: int) -> tuple[int, int]:
+    """Return initial horizontal/vertical Gtk.Paned positions in pixels."""
+    tree_position = round(width * INITIAL_TREE_WIDTH_PERCENT / 100.0)
+    operation_position = round(
+        height * (100.0 - INITIAL_OPERATION_HEIGHT_PERCENT) / 100.0
+    )
+    return tree_position, operation_position
 
 
 def config_dir() -> Path:
@@ -223,6 +239,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         self._build_ui()
         self._load_directory(self.current_path)
         self._building_ui = False
+        GLib.idle_add(self._apply_initial_pane_positions)
         self._maybe_preview()
 
         if self.state.settings["fullscreen"]:
@@ -281,7 +298,143 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         action("help", lambda *_: self._show_help())
         action("about", lambda *_: self._show_about())
 
+    def _install_application_theme(self) -> None:
+        """Install GPRename's high-contrast application-local GTK4 theme."""
+        css = """
+        window.gprename-window {
+            background-color: #eef2f7;
+            color: #172033;
+        }
+
+        window.gprename-window .gprename-tree-panel {
+            background-color: #e3eaf3;
+            border-right: 2px solid #64748b;
+        }
+
+        window.gprename-window .gprename-tree-panel listview {
+            background-color: #e3eaf3;
+            color: #172033;
+        }
+
+        window.gprename-window .gprename-tree-panel row {
+            min-height: 30px;
+            padding: 2px 6px;
+            color: #172033;
+            border-radius: 4px;
+        }
+
+        window.gprename-window .gprename-tree-panel row:hover {
+            background-color: #cbd9ea;
+        }
+
+        window.gprename-window .gprename-tree-panel row:selected {
+            background-color: #245b9e;
+            color: #ffffff;
+        }
+
+        window.gprename-window .gprename-tree-panel row:selected label {
+            color: #ffffff;
+        }
+
+        window.gprename-window .gprename-tree-panel treeexpander {
+            color: #172033;
+        }
+
+        window.gprename-window .gprename-preview-panel {
+            background-color: #ffffff;
+            color: #172033;
+        }
+
+        window.gprename-window .gprename-preview-panel columnview {
+            background-color: #ffffff;
+            color: #172033;
+        }
+
+        window.gprename-window .gprename-preview-panel columnview row {
+            min-height: 28px;
+        }
+
+        window.gprename-window .gprename-preview-panel columnview row:hover {
+            background-color: #e8f0fb;
+        }
+
+        window.gprename-window .gprename-preview-panel columnview row:selected {
+            background-color: #b9d4f5;
+            color: #10213a;
+        }
+
+        window.gprename-window .gprename-preview-panel columnview row:selected label {
+            color: #10213a;
+        }
+
+        window.gprename-window .gprename-preview-panel header {
+            background-color: #d5dfec;
+            color: #172033;
+            font-weight: 700;
+            border-bottom: 2px solid #64748b;
+        }
+
+        window.gprename-window .gprename-operations {
+            background-color: #dfe7f0;
+            color: #172033;
+            border-top: 2px solid #64748b;
+        }
+
+        window.gprename-window .gprename-section-title {
+            color: #172033;
+            font-weight: 700;
+        }
+
+        window.gprename-window button {
+            min-height: 30px;
+        }
+
+        window.gprename-window button.suggested-action {
+            background-color: #245b9e;
+            color: #ffffff;
+            font-weight: 700;
+        }
+
+        window.gprename-window button.suggested-action:hover {
+            background-color: #1d4d87;
+        }
+
+        window.gprename-window entry,
+        window.gprename-window spinbutton {
+            background-color: #ffffff;
+            color: #172033;
+        }
+
+        window.gprename-window separator {
+            background-color: #64748b;
+            min-width: 1px;
+            min-height: 1px;
+        }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        display = self.get_display()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+    def _apply_initial_pane_positions(self) -> bool:
+        """Apply responsive startup pane positions once the panes are allocated."""
+        width = self.hpaned.get_width()
+        height = self.main_paned.get_height()
+        if width <= 0 or height <= 0:
+            return True
+
+        tree_position, operation_position = initial_pane_positions(width, height)
+        self.hpaned.set_position(tree_position)
+        self.main_paned.set_position(operation_position)
+        return False
+
     def _build_ui(self) -> None:
+        self.add_css_class("gprename-window")
+        self._install_application_theme()
+
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_child(root)
 
@@ -307,8 +460,11 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         factory.connect("bind", self._tree_bind)
         tree_view = Gtk.ListView.new(tree_selection, factory)
         tree_view.set_vexpand(True)
+        tree_view.set_tooltip_text(_("Click a folder to navigate. Expand folders to browse their subfolders."))
+        tree_view.set_cursor(Gdk.Cursor.new_from_name("pointer"))
         tree_scroll = Gtk.ScrolledWindow()
         tree_scroll.set_min_content_width(180)
+        tree_scroll.add_css_class("gprename-tree-panel")
         tree_scroll.set_child(tree_view)
         upper.set_start_child(tree_scroll)
         self.tree_selection = tree_selection
@@ -327,8 +483,10 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         self.dir_list = self._make_preview_list(self.dir_selection)
 
         self.file_scroller = Gtk.ScrolledWindow()
+        self.file_scroller.add_css_class("gprename-preview-panel")
         self.file_scroller.set_child(self.file_list)
         self.dir_scroller = Gtk.ScrolledWindow()
+        self.dir_scroller.add_css_class("gprename-preview-panel")
         self.dir_scroller.set_child(self.dir_list)
 
         self.file_dir_stack = Gtk.Stack()
@@ -342,6 +500,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
 
         # Operation controls.
         lower = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        lower.add_css_class("gprename-operations")
         lower.set_margin_top(4)
         lower.set_margin_bottom(4)
         lower.set_margin_start(6)
@@ -363,6 +522,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         button_box.append(self.preview_button)
 
         self.apply_button = Gtk.Button(label=_("Rename"))
+        self.apply_button.add_css_class("suggested-action")
         self.apply_button.connect("clicked", lambda *_: self.rename_now())
         button_box.append(self.apply_button)
 
@@ -413,16 +573,23 @@ class GPRenameWindow(Gtk.ApplicationWindow):
 
     def _tree_setup(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
         expander = Gtk.TreeExpander()
+        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        folder = Gtk.Image.new_from_icon_name("folder-symbolic")
         label = Gtk.Label(xalign=0)
-        expander.set_child(label)
+        label.set_hexpand(True)
+        row_box.append(folder)
+        row_box.append(label)
+        expander.set_child(row_box)
         list_item.set_child(expander)
 
     def _tree_bind(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
         row = list_item.get_item()
         expander = list_item.get_child()
         expander.set_list_row(row)
+        row_box = expander.get_child()
+        label = row_box.get_last_child()
         node = row.get_item()
-        expander.get_child().set_text(node.name)
+        label.set_text(node.name)
 
     def _make_preview_list(self, selection: Gtk.SelectionModel) -> Gtk.Widget:
         """Create the two-column Name/New name preview using Gtk.ColumnView."""
