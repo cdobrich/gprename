@@ -425,52 +425,49 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         expander.get_child().set_text(node.name)
 
     def _make_preview_list(self, selection: Gtk.SelectionModel) -> Gtk.Widget:
-        # GTK4 has no GtkTreeView.  Use a small two-column header above the
-        # ListView so the preview is always visible and clearly identifies
-        # the original and proposed names.  The second column is populated
-        # by preview() and remains visible when automatic preview is disabled.
-        factory = Gtk.SignalListItemFactory()
+        """Create the two-column Name/New name preview using Gtk.ColumnView."""
+        old_factory = Gtk.SignalListItemFactory()
+        new_factory = Gtk.SignalListItemFactory()
 
-        def setup(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
-            grid = Gtk.Grid(column_spacing=12)
-            grid.set_hexpand(True)
-            old = Gtk.Label(xalign=0)
-            old.set_hexpand(True)
-            new = Gtk.Label(xalign=0)
-            new.set_hexpand(True)
-            grid.attach(old, 0, 0, 1, 1)
-            grid.attach(new, 1, 0, 1, 1)
-            item.set_child(grid)
+        def setup_label(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+            label = Gtk.Label(xalign=0)
+            label.set_hexpand(True)
+            label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+            label.set_margin_start(6)
+            label.set_margin_end(6)
+            item.set_child(label)
 
-        def bind(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+        def bind_old(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
             obj = item.get_item()
-            grid = item.get_child()
-            grid.get_child_at(0, 0).set_text(obj.name)
-            grid.get_child_at(1, 0).set_text(obj.new_name or "")
+            item.get_child().set_text(obj.name if obj is not None else "")
 
-        factory.connect("setup", setup)
-        factory.connect("bind", bind)
-        view = Gtk.ListView.new(selection, factory)
+        def bind_new(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+            obj = item.get_item()
+            item.get_child().set_text(obj.new_name if obj is not None else "")
+
+        old_factory.connect("setup", setup_label)
+        old_factory.connect("bind", bind_old)
+        new_factory.connect("setup", setup_label)
+        new_factory.connect("bind", bind_new)
+
+        view = Gtk.ColumnView.new(selection)
         view.set_vexpand(True)
         view.set_hexpand(True)
-        view.connect("activate", self._list_activate)
+        view.set_show_row_separators(True)
+        view.set_show_column_separators(True)
+        view.set_single_click_activate(False)
 
-        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        header = Gtk.Grid(column_spacing=12)
-        header.set_hexpand(True)
-        header.set_margin_start(6)
-        header.set_margin_end(6)
-        header.set_margin_top(4)
-        header.set_margin_bottom(4)
-        old_header = Gtk.Label(label=_("Name"), xalign=0)
-        old_header.set_hexpand(True)
-        new_header = Gtk.Label(label=_("New name"), xalign=0)
-        new_header.set_hexpand(True)
-        header.attach(old_header, 0, 0, 1, 1)
-        header.attach(new_header, 1, 0, 1, 1)
-        container.append(header)
-        container.append(view)
-        return container
+        old_column = Gtk.ColumnViewColumn.new(_("Name"), old_factory)
+        old_column.set_expand(True)
+        old_column.set_resizable(True)
+
+        new_column = Gtk.ColumnViewColumn.new(_("New name"), new_factory)
+        new_column.set_expand(True)
+        new_column.set_resizable(True)
+
+        view.append_column(old_column)
+        view.append_column(new_column)
+        return view
 
     def _list_activate(self, _view: Gtk.ListView, _position: int) -> None:
         if self.state.settings["auto_preview"]:
@@ -952,13 +949,6 @@ class GPRenameWindow(Gtk.ApplicationWindow):
             self.preview_names.append(original)
             self.preview_new_names.append(new)
             store.get_item(i).new_name = new
-
-        # Gio.ListStore does not know that a plain Python attribute changed.
-        # Emit an item-change notification by replacing each item with the
-        # same object, which causes the ListView factory to rebind the row.
-        for i in range(store.get_n_items()):
-            item = store.get_item(i)
-            store.splice(i, 1, [item])
 
         self._update_status()
         self._update_preview_buttons()
