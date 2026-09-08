@@ -691,8 +691,6 @@ class GPRenameWindow(Gtk.ApplicationWindow):
     def _update_status(self) -> None:
         files = self.file_store.get_n_items()
         dirs = self.dir_store.get_n_items()
-        _, selection = self._selected_model()
-        selected = selection.get_n_items() if hasattr(selection, "get_n_items") else 0
         # GTK4 MultiSelection does not expose a count directly; calculate it.
         selected = 0
         store, selection = self._selected_model()
