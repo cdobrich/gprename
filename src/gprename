@@ -340,6 +340,17 @@ class GPRenameWindow(Gtk.ApplicationWindow):
             color: #172033;
         }
 
+        window.gprename-window .gprename-tree-panel treeexpander expander {
+            color: #172033;
+            min-width: 18px;
+            min-height: 18px;
+        }
+
+        window.gprename-window .gprename-tree-panel row:selected treeexpander,
+        window.gprename-window .gprename-tree-panel row:selected treeexpander expander {
+            color: #ffffff;
+        }
+
         window.gprename-window .gprename-preview-panel {
             background-color: #ffffff;
             color: #172033;
@@ -472,6 +483,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         root_row = self.tree_model.get_item(0)
         if root_row is not None:
             root_row.set_expanded(True)
+        self._expand_tree_to_path(self.current_path)
 
         # File/directory list.
         self.file_store = Gio.ListStore.new(PreviewItem)
@@ -572,7 +584,13 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         return root
 
     def _tree_setup(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
+        # Gtk.TreeExpander is the GTK4 replacement for the old TreeView
+        # expander column.  It supplies the standard expand/collapse arrow,
+        # keyboard handling, indentation, and the visual expanded state.
         expander = Gtk.TreeExpander()
+        expander.set_hide_expander(False)
+        expander.set_indent_for_icon(True)
+
         row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         folder = Gtk.Image.new_from_icon_name("folder-symbolic")
         label = Gtk.Label(xalign=0)
@@ -586,10 +604,58 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         row = list_item.get_item()
         expander = list_item.get_child()
         expander.set_list_row(row)
+        expander.set_hide_expander(False)
         row_box = expander.get_child()
         label = row_box.get_last_child()
         node = row.get_item()
         label.set_text(node.name)
+
+    def _expand_tree_to_path(self, target_path: str) -> bool:
+        """Expand the tree from / through *target_path* and select it.
+
+        Gtk.TreeListModel creates descendant rows lazily: a child row does
+        not exist in the flat model until its parent is expanded.  Therefore
+        we expand one path component at a time and search the model again
+        after each expansion.  This makes an invocation such as
+        ``gprename /home/bob`` open with /, /home, and /home/bob visible.
+        """
+        target = str(Path(target_path).resolve())
+        parts = Path(target).parts
+        if not parts or parts[0] != os.sep:
+            return False
+
+        targets = []
+        current = Path(os.sep)
+        targets.append(str(current))
+        for part in parts[1:]:
+            current /= part
+            targets.append(str(current))
+
+        selected_index = -1
+        for wanted in targets:
+            found = False
+            for index in range(self.tree_model.get_n_items()):
+                row = self.tree_model.get_item(index)
+                if row is None:
+                    continue
+                item = row.get_item()
+                if item is None:
+                    continue
+                if str(Path(item.path).resolve()) != wanted:
+                    continue
+
+                found = True
+                selected_index = index
+                if wanted != targets[-1] and not row.get_expanded():
+                    row.set_expanded(True)
+                break
+
+            if not found:
+                break
+
+        if selected_index >= 0:
+            self.tree_selection.set_selected(selected_index)
+        return False
 
     def _make_preview_list(self, selection: Gtk.SelectionModel) -> Gtk.Widget:
         """Create the two-column Name/New name preview using Gtk.ColumnView."""
@@ -1320,6 +1386,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         root_row = self.tree_model.get_item(0)
         if root_row is not None:
             root_row.set_expanded(True)
+        self._expand_tree_to_path(self.current_path)
 
     def _show_filter(self) -> None:
         dialog = Gtk.Window(transient_for=self, modal=True, title=_("Filter"))
