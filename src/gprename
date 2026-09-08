@@ -120,7 +120,7 @@ class AppState:
     def __init__(self) -> None:
         self.settings = {
             "trim_spaces": True,
-            "auto_preview": False,
+            "auto_preview": True,
             "zero_autofill": True,
             "fullscreen": False,
             "width": 900,
@@ -424,7 +424,11 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         node = row.get_item()
         expander.get_child().set_text(node.name)
 
-    def _make_preview_list(self, selection: Gtk.SelectionModel) -> Gtk.ListView:
+    def _make_preview_list(self, selection: Gtk.SelectionModel) -> Gtk.Widget:
+        # GTK4 has no GtkTreeView.  Use a small two-column header above the
+        # ListView so the preview is always visible and clearly identifies
+        # the original and proposed names.  The second column is populated
+        # by preview() and remains visible when automatic preview is disabled.
         factory = Gtk.SignalListItemFactory()
 
         def setup(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
@@ -442,7 +446,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
             obj = item.get_item()
             grid = item.get_child()
             grid.get_child_at(0, 0).set_text(obj.name)
-            grid.get_child_at(1, 0).set_text(obj.new_name)
+            grid.get_child_at(1, 0).set_text(obj.new_name or "")
 
         factory.connect("setup", setup)
         factory.connect("bind", bind)
@@ -450,7 +454,23 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         view.set_vexpand(True)
         view.set_hexpand(True)
         view.connect("activate", self._list_activate)
-        return view
+
+        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        header = Gtk.Grid(column_spacing=12)
+        header.set_hexpand(True)
+        header.set_margin_start(6)
+        header.set_margin_end(6)
+        header.set_margin_top(4)
+        header.set_margin_bottom(4)
+        old_header = Gtk.Label(label=_("Name"), xalign=0)
+        old_header.set_hexpand(True)
+        new_header = Gtk.Label(label=_("New name"), xalign=0)
+        new_header.set_hexpand(True)
+        header.attach(old_header, 0, 0, 1, 1)
+        header.attach(new_header, 1, 0, 1, 1)
+        container.append(header)
+        container.append(view)
+        return container
 
     def _list_activate(self, _view: Gtk.ListView, _position: int) -> None:
         if self.state.settings["auto_preview"]:
@@ -746,10 +766,15 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         self._maybe_preview()
 
     def _action_auto_preview(self, action: Gio.SimpleAction, _parameter) -> None:
-        self.state.settings["auto_preview"] = not self.state.settings["auto_preview"]
-        action.set_state(GLib.Variant("b", self.state.settings["auto_preview"]))
+        active = not self.state.settings["auto_preview"]
+        self.state.settings["auto_preview"] = active
+        action.set_state(GLib.Variant("b", active))
         self._update_preview_buttons()
-        self._maybe_preview()
+        # Keep the last calculated preview visible when automatic preview is
+        # turned off.  This matches the original application's semantics:
+        # automatic preview controls when the calculation runs, not whether
+        # the New name column exists.
+        self.preview()
 
     def _action_remember(self, action: Gio.SimpleAction, _parameter) -> None:
         self.state.settings["remember_last_directory"] = not self.state.settings["remember_last_directory"]
@@ -786,7 +811,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
     def _update_preview_buttons(self) -> None:
         auto = self.state.settings["auto_preview"]
         self.preview_button.set_sensitive(not auto)
-        self.apply_button.set_sensitive(auto or bool(self.preview_new_names))
+        self.apply_button.set_sensitive(bool(self.preview_new_names))
 
     def _strip(self, value: str) -> str:
         if not self.state.settings["trim_spaces"]:
@@ -927,6 +952,13 @@ class GPRenameWindow(Gtk.ApplicationWindow):
             self.preview_names.append(original)
             self.preview_new_names.append(new)
             store.get_item(i).new_name = new
+
+        # Gio.ListStore does not know that a plain Python attribute changed.
+        # Emit an item-change notification by replacing each item with the
+        # same object, which causes the ListView factory to rebind the row.
+        for i in range(store.get_n_items()):
+            item = store.get_item(i)
+            store.splice(i, 1, [item])
 
         self._update_status()
         self._update_preview_buttons()
