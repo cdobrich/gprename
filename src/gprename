@@ -338,17 +338,38 @@ class GPRenameWindow(Gtk.ApplicationWindow):
 
         window.gprename-window .gprename-tree-panel treeexpander {
             color: #172033;
+            min-height: 28px;
         }
 
-        window.gprename-window .gprename-tree-panel treeexpander expander {
+        /*
+         * GtkTreeExpander exposes an ``expander`` CSS node for its native
+         * disclosure control. Give that node an explicit icon instead of
+         * relying on the desktop theme's expander styling. The checked
+         * state is the expanded state documented by GTK4.
+         */
+        window.gprename-window .gprename-tree-panel treeexpander > expander {
+            min-width: 22px;
+            min-height: 22px;
+            margin-start: 2px;
+            margin-end: 2px;
+            -gtk-icon-source: -gtk-icontheme("pan-end-symbolic");
             color: #172033;
-            min-width: 18px;
-            min-height: 18px;
+            -gtk-icon-filter: brightness(0.55);
         }
 
-        window.gprename-window .gprename-tree-panel row:selected treeexpander,
-        window.gprename-window .gprename-tree-panel row:selected treeexpander expander {
+        window.gprename-window .gprename-tree-panel treeexpander > expander:checked {
+            -gtk-icon-source: -gtk-icontheme("pan-down-symbolic");
+            color: #0b3d78;
+            -gtk-icon-filter: brightness(0.45);
+        }
+
+        window.gprename-window .gprename-tree-panel row:hover treeexpander > expander {
+            color: #082f5f;
+        }
+
+        window.gprename-window .gprename-tree-panel row:selected treeexpander > expander {
             color: #ffffff;
+            -gtk-icon-filter: brightness(1.0);
         }
 
         window.gprename-window .gprename-preview-panel {
@@ -598,6 +619,7 @@ class GPRenameWindow(Gtk.ApplicationWindow):
         row_box.append(folder)
         row_box.append(label)
         expander.set_child(row_box)
+        list_item.set_focusable(False)
         list_item.set_child(expander)
 
     def _tree_bind(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
