@@ -438,17 +438,52 @@ class GPRenameWindow(Gtk.ApplicationWindow):
             item.set_child(label)
 
         def bind_old(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+            label = item.get_child()
             obj = item.get_item()
-            item.get_child().set_text(obj.name if obj is not None else "")
+            label.set_text(obj.name if obj is not None else "")
 
         def bind_new(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+            label = item.get_child()
+            old_handler = getattr(label, "_gprename_notify_handler", None)
+            old_obj = getattr(label, "_gprename_bound_object", None)
+            if old_handler is not None and old_obj is not None:
+                try:
+                    old_obj.disconnect(old_handler)
+                except (TypeError, ValueError):
+                    pass
+                label._gprename_notify_handler = None
+                label._gprename_bound_object = None
+
             obj = item.get_item()
-            item.get_child().set_text(obj.new_name if obj is not None else "")
+            if obj is None:
+                label.set_text("")
+                return
+
+            label.set_text(obj.new_name or "")
+
+            def changed(_obj: PreviewItem, _pspec: GObject.ParamSpec) -> None:
+                label.set_text(_obj.new_name or "")
+
+            label._gprename_bound_object = obj
+            label._gprename_notify_handler = obj.connect("notify::new-name", changed)
+
+        def unbind_new(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+            label = item.get_child()
+            handler = getattr(label, "_gprename_notify_handler", None)
+            obj = getattr(label, "_gprename_bound_object", None)
+            if handler is not None and obj is not None:
+                try:
+                    obj.disconnect(handler)
+                except (TypeError, ValueError):
+                    pass
+            label._gprename_notify_handler = None
+            label._gprename_bound_object = None
 
         old_factory.connect("setup", setup_label)
         old_factory.connect("bind", bind_old)
         new_factory.connect("setup", setup_label)
         new_factory.connect("bind", bind_new)
+        new_factory.connect("unbind", unbind_new)
 
         view = Gtk.ColumnView.new(selection)
         view.set_vexpand(True)
@@ -808,7 +843,14 @@ class GPRenameWindow(Gtk.ApplicationWindow):
     def _update_preview_buttons(self) -> None:
         auto = self.state.settings["auto_preview"]
         self.preview_button.set_sensitive(not auto)
-        self.apply_button.set_sensitive(bool(self.preview_new_names))
+        store, _selection = self._selected_model()
+        has_change = False
+        for i in range(store.get_n_items()):
+            item = store.get_item(i)
+            if item.new_name and item.new_name != Path(item.name).name:
+                has_change = True
+                break
+        self.apply_button.set_sensitive(has_change)
 
     def _strip(self, value: str) -> str:
         if not self.state.settings["trim_spaces"]:
@@ -929,6 +971,12 @@ class GPRenameWindow(Gtk.ApplicationWindow):
 
     def preview(self) -> None:
         store, selection = self._selected_model()
+        # Always clear stale preview data before calculating the new result.
+        # The ColumnView cells are kept synchronized with PreviewItem.new_name
+        # through the notify::new-name handler installed by _make_preview_list.
+        for i in range(store.get_n_items()):
+            store.get_item(i).new_name = ""
+
         all_names = []
         selected = []
         for i in range(store.get_n_items()):
